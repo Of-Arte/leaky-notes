@@ -13,6 +13,7 @@ Two flaws are planted here:
 """
 
 import sqlite3
+from werkzeug.security import generate_password_hash, check_password_hash
 
 from flask import Flask, g, jsonify, request
 
@@ -41,12 +42,14 @@ def register():
     username, password = data.get("username"), data.get("password")
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
+
+    password_hash = generate_password_hash(password)
     db = get_db()
     try:
         # FLAW 1: the password is written straight to the database as plaintext.
         db.execute(
-            "INSERT INTO users (username, password) VALUES (?, ?)",
-            (username, password),
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, password_hash),
         )
         db.commit()
     except sqlite3.IntegrityError:
