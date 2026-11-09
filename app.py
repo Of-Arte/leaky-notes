@@ -61,15 +61,18 @@ def register():
 def login():
     data = request.get_json(silent=True) or {}
     username, password = data.get("username"), data.get("password")
-    row = get_db().execute(
-        "SELECT * FROM users WHERE username = ?", (username,)
-    ).fetchone()
-    # FLAW 1 (cont.): plaintext comparison, because the stored value is plaintext.
-    if row is None or row["password"] != password:
+    # If either field is missing, treat as bad credentials
+    if not username or not password:
         return jsonify({"error": "bad credentials"}), 401
-    # A "token" that is just the user id in the clear. Not how real auth works;
-    # good enough to demonstrate the authorization flaw below.
-    return jsonify({"token": f"user-{row['id']}"}), 200
+    row = get_db().execute(
+        "SELECT id, username, password_hash FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    # Generic failure: unknown user OR wrong password
+    if row is None or not check_password_hash(row["password_hash"], password):
+        return jsonify({"error": "bad credentials"}), 401
+
+    # Success: return authenticated identity (no tokens yet)
+    return jsonify({"user": {"id": row['id'], "username": row['username']}}), 200
 
 
 def current_user_id():
