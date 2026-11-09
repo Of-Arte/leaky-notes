@@ -63,7 +63,7 @@ def login():
     username, password = data.get("username"), data.get("password")
     # If either field is missing, treat as bad credentials
     if not username or not password:
-        return jsonify({"error": "bad credentials"}), 401
+        return jsonify({"error": "missing credentials"}), 400
     row = get_db().execute(
         "SELECT id, username, password_hash FROM users WHERE username = ?", (username,)
     ).fetchone()
