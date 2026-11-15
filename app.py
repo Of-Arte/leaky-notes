@@ -13,14 +13,20 @@ Two flaws are planted here:
 """
 
 import sqlite3
+import os
+import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
-
 from flask import Flask, g, jsonify, request
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 DATABASE = "leaky.db"
 
 app = Flask(__name__)
 
+app.config["JWT_SECRET"] = os.environ.get("JWT_SECRET")
+
+load_dotenv()
 
 def get_db():
     if "db" not in g:
@@ -46,7 +52,6 @@ def register():
     password_hash = generate_password_hash(password)
     db = get_db()
     try:
-        # FLAW 1: the password is written straight to the database as plaintext.
         db.execute(
             "INSERT INTO users (username, password_hash) VALUES (?, ?)",
             (username, password_hash),
@@ -59,20 +64,46 @@ def register():
 
 @app.post("/login")
 def login():
+    auth_header = request.headers.get("Authorization")
+
+    if not auth_header:
+        return jsonify({"error": "Authorization header missing"}), 401
+        
     data = request.get_json(silent=True) or {}
     username, password = data.get("username"), data.get("password")
     # If either field is missing, treat as bad credentials
     if not username or not password:
-        return jsonify({"error": "missing credentials"}), 400
+        return jsonify({"error": "Username and password combination not found."}), 400
+
     row = get_db().execute(
         "SELECT id, username, password_hash FROM users WHERE username = ?", (username,)
     ).fetchone()
+
     # Generic failure: unknown user OR wrong password
     if row is None or not check_password_hash(row["password_hash"], password):
         return jsonify({"error": "bad credentials"}), 401
 
-    # Success: return authenticated identity (no tokens yet)
-    return jsonify({"user": {"id": row['id'], "username": row['username']}}), 200
+    # Success: create JWT carrying the authenticated identity
+    payload = {
+        "sub": str(row["id"]),  # user id as STRING
+        "username": row["username"],
+        "exp": datetime.utcnow() + timedelta(hours=1),
+    }
+
+    token = jwt.encode(
+        payload,
+        app.config["JWT_SECRET"],
+        algorithm="HS256",
+    )
+
+    # Success: return authenticated identity + token
+    return jsonify({
+        "user": {
+            "id": row["id"],
+            "username": row["username"],
+        },
+        "token": token,
+    }), 200
 
 
 def current_user_id():
