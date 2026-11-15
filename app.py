@@ -15,6 +15,7 @@ Two flaws are planted here:
 import sqlite3
 import os
 import jwt
+from jwt import ExpiredSignatureError
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import Flask, g, jsonify, request
 from dotenv import load_dotenv
@@ -38,6 +39,7 @@ def get_db():
 @app.teardown_appcontext
 def close_db(exception):
     db = g.pop("db", None)
+
     if db is not None:
         db.close()
 
@@ -46,29 +48,28 @@ def close_db(exception):
 def register():
     data = request.get_json(silent=True) or {}
     username, password = data.get("username"), data.get("password")
+
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
 
     password_hash = generate_password_hash(password)
     db = get_db()
+
     try:
         db.execute(
             "INSERT INTO users (username, password_hash) VALUES (?, ?)",
             (username, password_hash),
         )
         db.commit()
+
     except sqlite3.IntegrityError:
         return jsonify({"error": "username taken"}), 409
+
     return jsonify({"message": f"registered {username}"}), 201
 
 
 @app.post("/login")
 def login():
-    auth_header = request.headers.get("Authorization")
-
-    if not auth_header:
-        return jsonify({"error": "Authorization header missing"}), 401
-        
     data = request.get_json(silent=True) or {}
     username, password = data.get("username"), data.get("password")
     # If either field is missing, treat as bad credentials
@@ -78,24 +79,20 @@ def login():
     row = get_db().execute(
         "SELECT id, username, password_hash FROM users WHERE username = ?", (username,)
     ).fetchone()
-
     # Generic failure: unknown user OR wrong password
     if row is None or not check_password_hash(row["password_hash"], password):
         return jsonify({"error": "bad credentials"}), 401
-
     # Success: create JWT carrying the authenticated identity
     payload = {
         "sub": str(row["id"]),  # user id as STRING
         "username": row["username"],
-        "exp": datetime.utcnow() + timedelta(hours=1),
+        "exp": datetime.utcnow() + timedelta(seconds=30),
     }
-
     token = jwt.encode(
         payload,
         app.config["JWT_SECRET"],
         algorithm="HS256",
     )
-
     # Success: return authenticated identity + token
     return jsonify({
         "user": {
@@ -105,20 +102,47 @@ def login():
         "token": token,
     }), 200
 
-
 def current_user_id():
-    token = request.headers.get("Authorization", "")
-    if token.startswith("user-"):
-        return int(token[len("user-"):])
-    return None
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return None
 
+    parts = auth_header.split()
+    # Expect exactly: "Bearer <token>"
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+
+    token = parts[1]
+
+    try:
+        payload = jwt.decode(
+            token,
+            app.config["JWT_SECRET"],
+            algorithms=["HS256"],
+        )
+
+    except ExpiredSignatureError:
+        # token is valid but past its exp
+        return "EXPIRED"
+    except jwt.PyJWTError:
+        # covers invalid signature, malformed token, expired, etc.
+        return None
+
+    # return the verified identity
+    return payload.get("sub")
 
 @app.post("/notes")
 def create_note():
     user_id = current_user_id()
+
+    if user_id == "EXPIRED":
+        return jsonify({"error": "Token expired, please log in again"}), 401
+
     if user_id is None:
         return jsonify({"error": "log in first"}), 401
+
     data = request.get_json(silent=True) or {}
+
     if not data.get("body"):
         return jsonify({"error": "body required"}), 400
     db = get_db()
@@ -139,8 +163,13 @@ def list_notes():
 @app.patch("/notes/<int:note_id>")
 def edit_note(note_id):
     user_id = current_user_id()
+
+    if user_id == "EXPIRED":
+        return jsonify({"error": "Token expired, please log in again"}), 401
+
     if user_id is None:
         return jsonify({"error": "log in first"}), 401
+        
     data = request.get_json(silent=True) or {}
     db = get_db()
     # FLAW 2: authentication is checked, but NOT authorization. We never confirm
@@ -149,6 +178,7 @@ def edit_note(note_id):
         "UPDATE notes SET body = ? WHERE id = ?", (data.get("body", ""), note_id)
     )
     db.commit()
+
     if cur.rowcount == 0:
         return jsonify({"error": "note not found"}), 404
     return jsonify({"id": note_id, "body": data.get("body", "")})
@@ -157,12 +187,18 @@ def edit_note(note_id):
 @app.delete("/notes/<int:note_id>")
 def delete_note(note_id):
     user_id = current_user_id()
+
+    if user_id == "EXPIRED":
+        return jsonify({"error": "Token expired, please log in again"}), 401
+
     if user_id is None:
-        return jsonify({"error": "log in first"}), 401
+        return jsonify({"error": "log in first"}), 401     
+
     db = get_db()
     # FLAW 2 (cont.): same missing ownership check on delete.
     cur = db.execute("DELETE FROM notes WHERE id = ?", (note_id,))
     db.commit()
+
     if cur.rowcount == 0:
         return jsonify({"error": "note not found"}), 404
     return "", 204
