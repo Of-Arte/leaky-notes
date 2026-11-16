@@ -20,6 +20,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask import Flask, g, jsonify, request
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
+from functools import wraps
+
 
 DATABASE = "leaky.db"
 
@@ -43,6 +45,64 @@ def close_db(exception):
     if db is not None:
         db.close()
 
+def current_user_id():
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return None
+
+    parts = auth_header.split()
+    # Expect exactly: "Bearer <token>"
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+
+    token = parts[1]
+
+    try:
+        payload = jwt.decode(
+            token,
+            app.config["JWT_SECRET"],
+            algorithms=["HS256"],
+        )
+
+    except ExpiredSignatureError:
+        # token is valid but past its exp
+        return "EXPIRED"
+    except jwt.PyJWTError:
+        # covers invalid signature, malformed token, expired, etc.
+        return None
+
+    sub = payload.get("sub")
+    role = payload.get("role")  # 👈 from token
+
+    if sub is None or role is None:
+        return None
+
+    try:
+        user_id = int(sub)
+    except (TypeError, ValueError):
+        return None
+
+    return {"id": user_id, "role": role}
+
+def require_user(view_func):
+    @wraps(view_func)
+    def wrapped_view(*args, **kwargs):
+        user = current_user_id()
+
+        # keep EXACT behavior you already had
+        if user == "EXPIRED":
+            return jsonify({"error": "Token expired, please log in again"}), 401
+
+        if user is None:
+            return jsonify({"error": "log in first"}), 401
+
+        # success: store full user dict for the route to use
+        g.current_user = user
+
+        # now call the original route function
+        return view_func(*args, **kwargs)
+
+    return wrapped_view
 
 @app.post("/register")
 def register():
@@ -77,7 +137,7 @@ def login():
         return jsonify({"error": "Username and password combination not found."}), 400
 
     row = get_db().execute(
-        "SELECT id, username, password_hash FROM users WHERE username = ?", (username,)
+        "SELECT id, username, password_hash, role FROM users WHERE username = ?", (username,)
     ).fetchone()
     # Generic failure: unknown user OR wrong password
     if row is None or not check_password_hash(row["password_hash"], password):
@@ -86,7 +146,8 @@ def login():
     payload = {
         "sub": str(row["id"]),  # user id as STRING
         "username": row["username"],
-        "exp": datetime.utcnow() + timedelta(seconds=30),
+        "role": row["role"],
+        "exp": datetime.utcnow() + timedelta(hours=1),
     }
     token = jwt.encode(
         payload,
@@ -102,44 +163,11 @@ def login():
         "token": token,
     }), 200
 
-def current_user_id():
-    auth_header = request.headers.get("Authorization")
-    if not auth_header:
-        return None
-
-    parts = auth_header.split()
-    # Expect exactly: "Bearer <token>"
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return None
-
-    token = parts[1]
-
-    try:
-        payload = jwt.decode(
-            token,
-            app.config["JWT_SECRET"],
-            algorithms=["HS256"],
-        )
-
-    except ExpiredSignatureError:
-        # token is valid but past its exp
-        return "EXPIRED"
-    except jwt.PyJWTError:
-        # covers invalid signature, malformed token, expired, etc.
-        return None
-
-    # return the verified identity
-    return payload.get("sub")
-
 @app.post("/notes")
+@require_user
 def create_note():
-    user_id = current_user_id()
-
-    if user_id == "EXPIRED":
-        return jsonify({"error": "Token expired, please log in again"}), 401
-
-    if user_id is None:
-        return jsonify({"error": "log in first"}), 401
+    user = g.current_user      # set by require_user
+    user_id = user["id"]
 
     data = request.get_json(silent=True) or {}
 
@@ -161,46 +189,71 @@ def list_notes():
 
 
 @app.patch("/notes/<int:note_id>")
+@require_user
 def edit_note(note_id):
-    user_id = current_user_id()
+    user = g.current_user
+    user_id = user["id"]
+    user_role = user["role"]
 
-    if user_id == "EXPIRED":
-        return jsonify({"error": "Token expired, please log in again"}), 401
-
-    if user_id is None:
-        return jsonify({"error": "log in first"}), 401
-        
     data = request.get_json(silent=True) or {}
     db = get_db()
-    # FLAW 2: authentication is checked, but NOT authorization. We never confirm
-    # that note_id belongs to user_id, so any logged-in user can edit any note.
-    cur = db.execute(
-        "UPDATE notes SET body = ? WHERE id = ?", (data.get("body", ""), note_id)
-    )
-    db.commit()
 
-    if cur.rowcount == 0:
+    # 1) Load the note
+    note = db.execute(
+        "SELECT * FROM notes WHERE id = ?",
+        (note_id,),
+    ).fetchone()
+
+    # 2) Not found → 404
+    if note is None:
         return jsonify({"error": "note not found"}), 404
+
+    # 3) Authorization: owner OR admin
+    is_owner = note["owner_id"] == user_id
+    is_admin = user_role == "admin"
+
+    if not (is_owner or is_admin):
+        return jsonify({"error": "forbidden: not your note"}), 403
+
+    # 4) Allowed → update
+    cur = db.execute(
+        "UPDATE notes SET body = ? WHERE id = ?",
+        (data.get("body", ""), note_id),
+    )
+
     return jsonify({"id": note_id, "body": data.get("body", "")})
 
 
 @app.delete("/notes/<int:note_id>")
+@require_user
 def delete_note(note_id):
-    user_id = current_user_id()
-
-    if user_id == "EXPIRED":
-        return jsonify({"error": "Token expired, please log in again"}), 401
-
-    if user_id is None:
-        return jsonify({"error": "log in first"}), 401     
+    user = g.current_user
+    user_id = user["id"]
+    user_role = user["role"]
 
     db = get_db()
-    # FLAW 2 (cont.): same missing ownership check on delete.
-    cur = db.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+
+    # 1) Load the note
+    note = db.execute(
+        "SELECT * FROM notes WHERE id = ?",
+        (note_id,),
+    ).fetchone()
+
+    # 2) Not found → 404
+    if note is None:
+        return jsonify({"error": "note not found"}), 404
+
+    # 3) Authorization: owner OR admin
+    is_owner = note["owner_id"] == user_id
+    is_admin = user_role == "admin"
+
+    if not (is_owner or is_admin):
+        return jsonify({"error": "forbidden: not your note"}), 403
+
+    # 4) Allowed → delete BEFORE returning
+    db.execute("DELETE FROM notes WHERE id = ?", (note_id,))
     db.commit()
 
-    if cur.rowcount == 0:
-        return jsonify({"error": "note not found"}), 404
     return "", 204
 
 
